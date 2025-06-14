@@ -5,7 +5,6 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const eventSourceRef = useRef(null);
 
   const handleSend = async () => {
     if (!input.trim()) return;
@@ -19,7 +18,7 @@ export default function App() {
     const response = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: input })
+      body: JSON.stringify({ query: input })
     });
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
