@@ -1,6 +1,9 @@
 require('dotenv').config();
 const express = require('express');
 const timeout = require('connect-timeout');
+const { OpenAIEmbeddings } = require('@langchain/openai');
+const { FaissStore } = require('@langchain/community/vectorstores/faiss');
+const { dbPath } = require('./constants');
 const app = express();
 
 // 从环境变量获取配置
@@ -8,6 +11,15 @@ const MODEL_NAME = process.env.MODEL_NAME;
 const ARK_API_KEY = process.env.ARK_API_KEY;
 const PORT = process.env.PORT || 3000;
 const API_BASE_URL = process.env.API_BASE_URL;
+
+// 创建向量化模型
+const embeddings = new OpenAIEmbeddings({
+  model: process.env.EMBEDDING_MODEL,
+  configuration: {
+    apiKey: process.env.ARK_API_KEY,
+    baseURL: process.env.API_BASE_URL,
+  },
+});
 
 // 历史对话记录
 let historyMessages = [];
@@ -150,8 +162,13 @@ app.post('/api/chat', validateChatRequest, async (req, res) => {
     // 记录用户输入
     historyMessages.push({ role: 'user', content: query });
 
-    // 模拟通过外部检索到的内容
-    let externalContent = 'TestComp 是一个测试组件，它有 open、isDev、onChange 三个属性';
+    // 加载向量数据库
+    const vectorStore = await FaissStore.load(dbPath, embeddings);
+    // 检索相关内容
+    const retriever = vectorStore.asRetriever(2);
+    const result = await retriever.invoke(query);
+    // 拼接相关内容
+    const externalContent = result.map((item) => item.pageContent).join('\n');
 
     // 调用API并流式返回结果
     const response = await fetch(`${API_BASE_URL}/chat/completions`, {
