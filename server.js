@@ -5,6 +5,9 @@ const { OpenAIEmbeddings } = require('@langchain/openai');
 const { FaissStore } = require('@langchain/community/vectorstores/faiss');
 const { dbPath } = require('./constants');
 const app = express();
+const fs = require('fs');
+const path = require('path');
+const { z } = require('zod/v4');
 
 // 从环境变量获取配置
 const MODEL_NAME = process.env.MODEL_NAME;
@@ -20,6 +23,40 @@ const embeddings = new OpenAIEmbeddings({
     baseURL: process.env.API_BASE_URL,
   },
 });
+
+// 声明工具集
+const toolsMap = new Map([
+  [
+    'writeCode',
+    {
+      type: 'function',
+      function: {
+        name: 'writeCode',
+        description: '将代码写入到文件中',
+        parameters: z.object({
+          code: z.string().describe('代码内容'),
+        }),
+      },
+      fun: async ({ code }) => {
+        let result = '';
+
+        try {
+          await fs.promises.writeFile(path.join(__dirname, 'code.js'), code);
+          result = '代码写入完毕';
+        } catch (error) {
+          result = '代码写入失败';
+        }
+
+        return [
+          {
+            role: 'tool',
+            content: result,
+          },
+        ];
+      },
+    },
+  ],
+]);
 
 // 历史对话记录
 let historyMessages = [];
@@ -95,6 +132,8 @@ async function handleSseResponse(res, stream) {
   const decoder = new TextDecoder();
 
   let content = '';
+  let type = 'assistant';
+  let functionName = '';
 
   try {
     while (true) {
@@ -115,9 +154,21 @@ async function handleSseResponse(res, stream) {
 
         try {
           const parsed = JSON.parse(data);
-          if (parsed.choices) {
-            content += parsed.choices[0].delta.content;
-            res && res.write(`data: {"content": "${escapeSse(parsed.choices[0].delta.content)}"}\n\n`);
+          const reply = parsed.choices[0].delta.content;
+          const toolsCall = parsed.choices[0].delta.tool_calls;
+          if (reply) {
+            content += reply;
+            res && res.write(`data: {"content": "${escapeSse(reply)}"}\n\n`);
+          } else if (toolsCall) {
+            const arguments = toolsCall[0].function.arguments;
+            const name = toolsCall[0].function.name;
+            content += arguments;
+
+            if (name) {
+              type = 'tool';
+              functionName = name;
+              res && res.write(`data: {"content": "正在执行: ${functionName}"}\n\n`);
+            }
           }
         } catch (e) {
           console.error('解析响应失败:', e);
@@ -130,7 +181,19 @@ async function handleSseResponse(res, stream) {
     reader.releaseLock();
   }
 
-  return content;
+  if (type === 'tool') {
+    res && res.write(`data: {"content": " --> 执行完毕: ${functionName}"}\n\n`);
+  }
+
+  return {
+    type,
+    content,
+    functionName,
+  };
+}
+
+async function chatHandle() {
+  //
 }
 
 // 健康检查接口
@@ -153,11 +216,11 @@ app.post('/api/chat', validateChatRequest, async (req, res) => {
     res.write('data: {"status": "started"}\n\n');
 
     // 拼接过去三轮的对话
-    // const rounds = 3;
-    // const history = historyMessages
-    //   .slice(-rounds * 2)
-    //   .map((msg) => `${msg.role}: ${msg.content}`)
-    //   .join('\n');
+    const rounds = 3;
+    const history = historyMessages
+      .slice(-rounds * 2)
+      .map((msg) => `${msg.role}: ${msg.content}`)
+      .join('\n');
 
     // 记录用户输入
     historyMessages.push({ role: 'user', content: query });
@@ -169,6 +232,12 @@ app.post('/api/chat', validateChatRequest, async (req, res) => {
     const result = await retriever.invoke(query);
     // 拼接相关内容
     const externalContent = result.map((item) => item.pageContent).join('\n');
+
+    // 获取 tools
+    const tools = Array.from(toolsMap.values()).map(({ fun, ...item }) => ({
+      ...item,
+      parameters: z.toJSONSchema(item.function.parameters),
+    }));
 
     // 调用API并流式返回结果
     const response = await fetch(`${API_BASE_URL}/chat/completions`, {
@@ -187,7 +256,7 @@ app.post('/api/chat', validateChatRequest, async (req, res) => {
             你是一个专业的前端编程导师，你擅长 React、Webpack、Antd 这些前端流程的框架。你能够由浅入深的回答用户关于前端的问题。
 
             ## 历史对话
-            ${summarizeContent}
+            ${history}
 
             ## 参考内容
             你可以基于这些参考内容回答用户的问题： ${externalContent}
@@ -200,6 +269,7 @@ app.post('/api/chat', validateChatRequest, async (req, res) => {
           { role: 'user', content: query }, // 用户的输入
         ],
         stream: true,
+        tools,
       }),
     });
 
@@ -207,13 +277,22 @@ app.post('/api/chat', validateChatRequest, async (req, res) => {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
-    const aiContent = await handleSseResponse(res, response.body);
+    const llmResult = await handleSseResponse(res, response.body);
 
-    if (aiContent) {
-      historyMessages.push({ role: 'assistant', content: aiContent });
+    if (llmResult) {
+      historyMessages.push({ role: 'assistant', content: llmResult.content });
 
-      // LLM 总结法
-      getSummarizeHistory();
+      if (llmResult.type === 'tool') {
+        const tool = toolsMap.get(llmResult.functionName);
+        if (tool) {
+          const args = JSON.parse(llmResult.content);
+          const result = await tool.fun(args);
+          console.log('result >>>', result);
+          historyMessages.push(result);
+
+          // TODO: 重新调用一次 LLM 对话
+        }
+      }
     }
 
     res.end();
